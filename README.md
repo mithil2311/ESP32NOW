@@ -14,15 +14,9 @@ Wi-Fi credentials, or MAC addresses to enter.
 
 ## System diagram
 
-```mermaid
-flowchart LR
-    PA["USB power / PC"] --> A["ESP32 A<br/>CH340 · 30 pins · USB-C"]
-    PB["USB power / PC"] --> B["ESP32 B<br/>CH340 · 30 pins · USB-C"]
-    A -->|"ESP-NOW heartbeat + acknowledgement"| B
-    B -->|"ESP-NOW heartbeat + acknowledgement"| A
-    A --> LA["D2 / GPIO 2 LED<br/>Blink while contact is confirmed"]
-    B --> LB["D2 / GPIO 2 LED<br/>Blink while contact is confirmed"]
-```
+![Two separately powered ESP32 boards exchange ESP-NOW heartbeats and drive their D2 LEDs.](docs/diagrams/system.svg)
+
+[Editable diagram source](docs/diagrams/system.mmd)
 
 The boards communicate directly over their Wi-Fi radios. No router, internet
 connection, or signal wire between boards is needed. Each board has its own
@@ -64,20 +58,9 @@ Each board sends a small broadcast heartbeat containing its boot identifier,
 sequence number, and acknowledgement of the latest heartbeat received from the
 other board. Both boards use the same channel and application group value.
 
-```mermaid
-sequenceDiagram
-    participant A as ESP32 A
-    participant B as ESP32 B
-    A->>B: Heartbeat A1
-    Note over B: Receive A1; prepare acknowledgement
-    B->>A: Heartbeat B1 + acknowledgement of A1
-    Note over A: Fresh reply confirms two-way contact; start blinking
-    A->>B: Heartbeat A2 + acknowledgement of B1
-    Note over B: Fresh reply confirms two-way contact; start blinking
-    A->>B: Continue periodic heartbeats + acknowledgements
-    B->>A: Continue periodic heartbeats + acknowledgements
-    Note over A,B: If fresh acknowledgements stop for 3 seconds, LEDs turn off
-```
+![Heartbeat and acknowledgement exchange confirms communication in both directions.](docs/diagrams/handshake.svg)
+
+[Editable diagram source](docs/diagrams/handshake.mmd)
 
 A successful `esp_now_send()` call alone does **not** start blinking. The
 other board must acknowledge a heartbeat that this board actually submitted
@@ -90,16 +73,9 @@ heartbeats. Stale or unknown acknowledgements cannot refresh contact.
 Wi-Fi receive callbacks copy messages into a queue; the main loop handles
 contact tracking and LED output without blocking the radio task.
 
-```mermaid
-stateDiagram-v2
-    [*] --> Waiting
-    Waiting: LED OFF
-    Blinking: D2 toggles every 250 ms
-    Waiting --> Blinking: Fresh two-way acknowledgement
-    Blinking --> Waiting: No fresh acknowledgement for 3 seconds
-    Blinking --> Waiting: Peer reboot detected
-    Blinking --> Blinking: Fresh acknowledgements continue
-```
+![LED waits off, blinks during confirmed contact, and turns off after contact loss.](docs/diagrams/led-states.svg)
+
+[Editable diagram source](docs/diagrams/led-states.mmd)
 
 ## Open and build in VS Code
 
@@ -228,6 +204,7 @@ On Linux with Python 3 and g++ installed, run:
 
 ```sh
 python3 test/run_host_tests.py
+python3 test/verify_readme.py
 pio run --environment esp32dev
 ```
 
@@ -236,6 +213,12 @@ UndefinedBehaviorSanitizer. **All 16 software scenarios and the `esp32dev`
 firmware build passed during preparation of this project.** Physical radio
 reception, power stability, and onboard LED operation still require the
 board-to-board test after flashing.
+
+The README diagrams are checked SVG images generated from the linked Mermaid
+sources. They do not need GitHub to parse Mermaid when the page is opened.
+`test/verify_readme.py` checks image files, local links, Markdown fences, and
+the documented configuration and defaults against the firmware. See
+[diagram maintenance](docs/diagrams/README.md) for regeneration instructions.
 
 ## Troubleshooting
 
@@ -268,6 +251,8 @@ ESP32NOW/
 ├── include/range_link.h           # Heartbeat, contact tracking and LED timing
 ├── test/host/test_range_link.cpp   # 16 deterministic software scenarios
 ├── test/run_host_tests.py          # Host compiler/test runner
+├── test/verify_readme.py           # README links, diagram and setting checks
+├── docs/diagrams/                  # Editable Mermaid sources and checked SVGs
 ├── .gitignore                     # Excludes build output and local editor data
 └── README.md                      # Setup, diagrams and troubleshooting
 ```

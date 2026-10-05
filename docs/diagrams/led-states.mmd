@@ -1,0 +1,8 @@
+stateDiagram-v2
+    [*] --> Waiting
+    Waiting: LED OFF
+    Blinking: D2 toggles every 250 ms
+    Waiting --> Blinking: Fresh two-way acknowledgement
+    Blinking --> Waiting: No fresh acknowledgement for 3 seconds
+    Blinking --> Waiting: Peer reboot detected
+    Blinking --> Blinking: Fresh acknowledgements continue

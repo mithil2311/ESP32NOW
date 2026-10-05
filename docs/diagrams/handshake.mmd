@@ -1,0 +1,12 @@
+sequenceDiagram
+    participant A as ESP32 A
+    participant B as ESP32 B
+    A->>B: Heartbeat A1
+    Note over B: Receive A1 and prepare acknowledgement
+    B->>A: Heartbeat B1 + acknowledgement of A1
+    Note over A: Fresh reply confirms two-way contact and start blinking
+    A->>B: Heartbeat A2 + acknowledgement of B1
+    Note over B: Fresh reply confirms two-way contact and start blinking
+    A->>B: Continue periodic heartbeats + acknowledgements
+    B->>A: Continue periodic heartbeats + acknowledgements
+    Note over A,B: If fresh acknowledgements stop for 3 seconds, LEDs turn off

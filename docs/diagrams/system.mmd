@@ -1,0 +1,7 @@
+flowchart LR
+    PA["USB power / PC"] --> A["ESP32 A<br/>CH340 · 30 pins · USB-C"]
+    PB["USB power / PC"] --> B["ESP32 B<br/>CH340 · 30 pins · USB-C"]
+    A -->|"ESP-NOW heartbeat + acknowledgement"| B
+    B -->|"ESP-NOW heartbeat + acknowledgement"| A
+    A --> LA["D2 / GPIO 2 LED<br/>Blink while contact is confirmed"]
+    B --> LB["D2 / GPIO 2 LED<br/>Blink while contact is confirmed"]
