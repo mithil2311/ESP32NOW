@@ -13,7 +13,9 @@
 // D2 / GPIO 2 is the controllable LED on the intended 30-pin board.
 constexpr uint8_t LED_PIN = 2;
 constexpr bool LED_ACTIVE_LOW = false; // Set true for an inverted LED.
-constexpr uint8_t WIFI_CHANNEL = 1;
+constexpr uint8_t WIFI_CHANNEL = 6; // Try 11 on BOTH boards if 6 is congested.
+constexpr bool USE_LONG_RANGE = true;
+static_assert(WIFI_CHANNEL >= 1 && WIFI_CHANNEL <= 11, "Use channel 1-11");
 const uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 using range_led::Heartbeat;
 
@@ -25,7 +27,7 @@ struct ReceivedHeartbeat {
 
 QueueHandle_t receiveQueue = nullptr;
 range_led::RangeLink rangeLink;
-uint32_t lastTransmitAt = 0, transmitInterval = 0;
+range_led::HeartbeatSender heartbeatSender;
 uint32_t lastStatusAt = 0, transmitAttempts = 0;
 bool previouslyInRange = false;
 
@@ -97,6 +99,16 @@ void setup() {
   Serial.flush();
   checkEsp(esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE),
            "Set Wi-Fi channel");
+  const uint8_t protocol = USE_LONG_RANGE ? WIFI_PROTOCOL_LR :
+      (WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+  checkEsp(esp_wifi_set_protocol(WIFI_IF_STA, protocol), "Set radio protocol");
+  uint8_t activeProtocol = 0, activeChannel = 0;
+  wifi_second_chan_t secondaryChannel;
+  checkEsp(esp_wifi_get_protocol(WIFI_IF_STA, &activeProtocol), "Read radio protocol");
+  checkEsp(esp_wifi_get_channel(&activeChannel, &secondaryChannel), "Read radio channel");
+  if (activeProtocol != protocol || activeChannel != WIFI_CHANNEL) {
+    checkEsp(ESP_FAIL, "Verify radio configuration");
+  }
   checkEsp(esp_now_init(), "ESP-NOW init");
   esp_now_peer_info_t broadcastPeer{};
   memcpy(broadcastPeer.peer_addr, BROADCAST_MAC, sizeof(BROADCAST_MAC));
@@ -104,11 +116,20 @@ void setup() {
   broadcastPeer.ifidx = WIFI_IF_STA;
   broadcastPeer.encrypt = false;
   checkEsp(esp_now_add_peer(&broadcastPeer), "Add broadcast peer");
+  // Arduino-ESP32 2.x / ESP-IDF 4.4: explicitly select the LR PHY rate after
+  // radio and ESP-NOW initialization, before any packets are transmitted.
+  checkEsp(esp_wifi_config_espnow_rate(WIFI_IF_STA,
+      USE_LONG_RANGE ? WIFI_PHY_RATE_LORA_250K : WIFI_PHY_RATE_1M_L),
+      "Set ESP-NOW PHY rate");
   checkEsp(esp_now_register_recv_cb(onReceive), "Register receive callback");
   Serial.printf("My MAC: %s | Channel: %u\n", WiFi.macAddress().c_str(),
                 WIFI_CHANNEL);
+  Serial.printf("Radio: %s | PHY rate: %s | Max ACK retries: %u\n",
+                USE_LONG_RANGE ? "LR only" : "standard BGN",
+                USE_LONG_RANGE ? "250 kbit/s" : "1 Mbit/s",
+                range_led::kMaxRetries);
   Serial.println("Waiting for the other board...");
-  transmitInterval = 100 + (esp_random() % 200);
+  heartbeatSender.begin(millis(), 100 + (esp_random() % 200));
 }
 
 void loop() {
@@ -119,11 +140,9 @@ void loop() {
   }
 
   const uint32_t now = millis();
-  if (now - lastTransmitAt >= transmitInterval) {
-    lastTransmitAt = now;
-    // Jitter avoids both boards repeatedly transmitting at the same instant.
-    transmitInterval = 400 + (esp_random() % 201);
-    const Heartbeat packet = rangeLink.nextHeartbeat(now);
+  Heartbeat packet{};
+  bool isRetry = false;
+  if (heartbeatSender.prepare(now, rangeLink, esp_random(), packet, isRetry)) {
     ++transmitAttempts;
     const esp_err_t result = esp_now_send(
         BROADCAST_MAC, reinterpret_cast<const uint8_t *>(&packet), sizeof(packet));
@@ -143,9 +162,10 @@ void loop() {
   if (rangeLink.updateLed(now)) setLed(rangeLink.ledOn());
   if (now - lastStatusAt >= 2000) {
     lastStatusAt = now;
-    Serial.printf("%s | TX attempts=%lu RX=%lu ACK=%lu\n",
+    Serial.printf("%s | TX attempts=%lu RETRY=%lu RX=%lu ACK=%lu\n",
                   inRange ? "IN RANGE" : "WAITING / OUT OF RANGE",
                   static_cast<unsigned long>(transmitAttempts),
+                  static_cast<unsigned long>(heartbeatSender.retryCount()),
                   static_cast<unsigned long>(rangeLink.receivedCount()),
                   static_cast<unsigned long>(rangeLink.confirmedCount()));
   }

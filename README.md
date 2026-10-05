@@ -36,8 +36,10 @@ It is not a configuration for ESP32-S3, C3, or other chip variants.
 | LED output | D2 / GPIO 2 |
 | LED polarity | Active HIGH by default |
 | Wi-Fi interface | Station, without joining a router |
-| Wi-Fi channel | 1 on both boards |
-| Heartbeat interval | 400–600 ms, with randomized timing |
+| Wi-Fi channel | 6 on both boards |
+| Radio mode / rate | Espressif LR only / 250 kbit/s |
+| Normal new-heartbeat interval | 400–600 ms, with randomized timing |
+| ACK retry delay / limit | 300–400 ms / 2 retries after the first attempt |
 | Contact timeout | 3,000 ms |
 | LED toggle interval | 250 ms: two complete blinks per second |
 | Upload / Serial Monitor baud | 115200 |
@@ -68,14 +70,70 @@ recently. This checks the path in both directions.
 
 The source MAC identifies the discovered board. Boot identifiers separate
 messages from different runs; sequence numbers identify fresh messages.
-The firmware ignores invalid, self-originated, duplicate, and reordered
-heartbeats. Stale or unknown acknowledgements cannot refresh contact.
+The firmware ignores invalid, self-originated, and reordered heartbeats.
+A retried probe keeps its sequence number but carries the latest acknowledgement.
+It is not counted as a new heartbeat; its acknowledgement fields are processed
+if they confirm a new, recent probe. Repeating an old acknowledgement cannot
+keep the LEDs blinking. Stale or unknown acknowledgements cannot refresh contact.
 Wi-Fi receive callbacks copy messages into a queue; the main loop handles
 contact tracking and LED output without blocking the radio task.
 
 ![LED waits off, blinks during confirmed contact, and turns off after contact loss.](docs/diagrams/led-states.svg)
 
 [Editable diagram source](docs/diagrams/led-states.mmd)
+
+## Long-range mode and crowded environments
+
+**Both boards now use Espressif LR-only mode at 250 kbit/s on channel 6.**
+The firmware calls `esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_LR)` and
+selects `WIFI_PHY_RATE_LORA_250K` with `esp_wifi_config_espnow_rate()` after
+radio and ESP-NOW initialization. Despite the enum name, this is Espressif's
+Wi-Fi LR mode, not a separate LoRa radio.
+
+LR improves receive sensitivity at a lower data rate. It is suitable for small
+heartbeats, but it still shares the 2.4 GHz band and cannot remove interference.
+There is no guaranteed distance or guaranteed improvement in a particular
+crowd. See [Espressif's LR documentation](https://docs.espressif.com/projects/esp-idf/en/release-v4.4/esp32/api-guides/wifi.html#long-range-lr).
+
+At startup, the firmware reads back the active protocol and channel, checks
+radio configuration errors, and prints:
+
+```text
+Radio: LR only | PHY rate: 250 kbit/s | Max ACK retries: 2
+```
+
+### Channel selection
+
+Channel 6 is the default. If it is busy at your location, change `WIFI_CHANNEL`
+to `11`, rebuild, and upload to **both** boards. Compare communication at the
+same position using the RX, ACK, and RETRY counters. Neither channel is always
+quieter. The firmware uses a fixed channel and does not scan or hop channels.
+
+**Upload this updated firmware to both boards before testing.** Older firmware
+using channel 1 and standard Wi-Fi mode cannot communicate with this LR-only,
+channel-6 configuration. Keep `USE_LONG_RANGE` identical on both boards; set
+it to `false` on both to use standard BGN mode at 1 Mbit/s for comparison.
+
+### Acknowledgement retries
+
+Only one probe is outstanding at a time. If its ACK has not arrived after
+300–400 ms, the same probe is sent again, up to **two additional attempts**.
+The wait includes randomized jitter to reduce repeated collisions. A fresh
+ACK cancels the remaining retries. When the retry budget is exhausted, the
+board continues discovering its peer with a new probe rather than flooding
+retries indefinitely.
+
+A retry retains the probe sequence and updates the piggyback acknowledgement.
+This allows two boards that transmitted simultaneously to acknowledge each
+other through their retries. The normal new-heartbeat period is 400–600 ms;
+an unacknowledged cycle can take longer while its retries finish. The LED still
+switches off after three seconds without a fresh two-way confirmation.
+
+For the physical setup, keep the PCB antennas clear of metal and your body,
+use reliable power, and test antenna placement and height at the intended site.
+Lower data rates occupy the channel for longer, so retries are deliberately
+bounded. This firmware does not increase transmit power beyond the driver's
+default or modify the board's antenna hardware.
 
 ## Open and build in VS Code
 
@@ -155,9 +213,9 @@ Typical Serial Monitor output is:
 ```text
 Waiting for the other board...
 IN RANGE: D2 LED blinking
-IN RANGE | TX attempts=10 RX=9 ACK=8
+IN RANGE | TX attempts=10 RETRY=2 RX=9 ACK=8
 CONTACT LOST: LED off
-WAITING / OUT OF RANGE | TX attempts=18 RX=9 ACK=8
+WAITING / OUT OF RANGE | TX attempts=18 RETRY=6 RX=9 ACK=8
 ```
 
 The numbers above are illustrative. A status line is printed every two seconds.
@@ -165,7 +223,8 @@ The numbers above are illustrative. A status line is printed every two seconds.
 | Counter / message | Meaning |
 | --- | --- |
 | `TX attempts` | Heartbeat send attempts; this does not prove reception |
-| `RX` | Accepted heartbeats from the discovered peer |
+| `RETRY` | Additional transmission attempts for missing ACKs |
+| `RX` | Fresh heartbeats from the discovered peer; retries are not counted twice |
 | `ACK` | Fresh acknowledgements of recently submitted heartbeats |
 | `IN RANGE` | Recent two-way contact; LED blinking enabled |
 | `WAITING / OUT OF RANGE` | Fresh two-way contact is absent; LED off |
@@ -176,10 +235,14 @@ The numbers above are illustrative. A status line is printed every two seconds.
 | --- | --- | --- | --- |
 | `LED_PIN` | [src/main.cpp](src/main.cpp) | `2` | Controllable LED GPIO |
 | `LED_ACTIVE_LOW` | [src/main.cpp](src/main.cpp) | `false` | Set `true` if LOW turns the LED on |
-| `WIFI_CHANNEL` | [src/main.cpp](src/main.cpp) | `1` | Keep the same on both boards |
+| `WIFI_CHANNEL` | [src/main.cpp](src/main.cpp) | `6` | Try 11 if needed; keep the same on both boards |
+| `USE_LONG_RANGE` | [src/main.cpp](src/main.cpp) | `true` | LR-only at 250 kbit/s; keep identical on both boards |
 | `kGroup` | [include/range_link.h](include/range_link.h) | `0x32B11A01` | Keep the same for this pair |
 | `kTimeoutMs` | [include/range_link.h](include/range_link.h) | `3000` | Contact-loss timeout |
 | `kBlinkMs` | [include/range_link.h](include/range_link.h) | `250` | Time between LED toggles |
+| `kRetryBaseMs` | [include/range_link.h](include/range_link.h) | `300` | Minimum ACK wait between attempts |
+| `kRetryJitterMs` | [include/range_link.h](include/range_link.h) | `100` | Up to 100 ms additional randomized retry delay |
+| `kMaxRetries` | [include/range_link.h](include/range_link.h) | `2` | Extra attempts after the first transmission |
 
 Rebuild and upload after changing settings. Use a different `kGroup` for another
 pair operating nearby. This is a simple **unencrypted** broadcast demo, and the
@@ -199,6 +262,9 @@ suite simulates two boards and exercises the contact and LED logic, including:
 - Invalid, self-originated, duplicate, and reordered packets.
 - Stale acknowledgements and acknowledgements of unsent packets.
 - Clock/sequence rollover and an unrelated third board.
+- Bounded retry scheduling, ACK cancellation, and recovery of a dropped probe.
+- Fresh ACKs carried by duplicate retries, jitter across clock rollover, and
+  repeated retries that cannot preserve stale contact.
 
 On Linux with Python 3 and g++ installed, run:
 
@@ -209,7 +275,7 @@ pio run --environment esp32dev
 ```
 
 The tests compile with strict warnings, AddressSanitizer, and
-UndefinedBehaviorSanitizer. **All 16 software scenarios and the `esp32dev`
+UndefinedBehaviorSanitizer. **All 22 software scenarios and the `esp32dev`
 firmware build passed during preparation of this project.** Physical radio
 reception, power stability, and onboard LED operation still require the
 board-to-board test after flashing.
@@ -224,7 +290,7 @@ the documented configuration and defaults against the firmware. See
 
 | Symptom | What to check |
 | --- | --- |
-| `RX=0`, LED off | Power both boards, upload matching firmware, keep channel/group settings identical, and place boards nearby |
+| `RX=0`, LED off | Power both boards, upload matching firmware, keep channel/group/LR settings identical, and place boards nearby |
 | `RX` increases but `ACK` stays at zero | Verify both boards remain running and messages can pass both ways; compare their serial logs |
 | `IN RANGE` shown but LED does not blink | Check `LED_PIN`, `LED_ACTIVE_LOW`, and whether the board has a controllable GPIO 2 LED |
 | Repeated `Brownout detector was triggered` | Supply voltage is dropping; try a reliable cable and USB source, remove external loads, and check the board power circuit |
@@ -249,7 +315,7 @@ ESP32NOW/
 ├── platformio.ini                 # Board, framework, upload and monitor settings
 ├── src/main.cpp                   # ESP-NOW callbacks, startup, queue and GPIO output
 ├── include/range_link.h           # Heartbeat, contact tracking and LED timing
-├── test/host/test_range_link.cpp   # 16 deterministic software scenarios
+├── test/host/test_range_link.cpp   # 22 deterministic software scenarios
 ├── test/run_host_tests.py          # Host compiler/test runner
 ├── test/verify_readme.py           # README links, diagram and setting checks
 ├── docs/diagrams/                  # Editable Mermaid sources and checked SVGs
@@ -260,5 +326,6 @@ ESP32NOW/
 ## References
 
 - [PlatformIO: Espressif ESP32 Dev Module](https://docs.platformio.org/en/stable/boards/espressif32/esp32dev.html)
+- [Espressif: long-range radio mode](https://docs.espressif.com/projects/esp-idf/en/release-v4.4/esp32/api-guides/wifi.html#long-range-lr)
 - [Espressif: ESP-NOW API and acknowledgement guidance](https://docs.espressif.com/projects/esp-idf/en/release-v5.5/esp32/api-reference/network/esp_now.html)
 - [Espressif: brownout and other fatal errors](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/fatal-errors.html)

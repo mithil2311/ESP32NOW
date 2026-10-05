@@ -10,6 +10,11 @@ constexpr uint32_t kMagic = 0x45534E31;
 constexpr uint32_t kGroup = 0x32B11A01; // Keep identical on the two boards.
 constexpr uint32_t kTimeoutMs = 3000;
 constexpr uint32_t kBlinkMs = 250;
+constexpr uint32_t kHeartbeatMinMs = 400;
+constexpr uint32_t kHeartbeatJitterMs = 200;
+constexpr uint32_t kRetryBaseMs = 300;
+constexpr uint32_t kRetryJitterMs = 100;
+constexpr uint8_t kMaxRetries = 2;
 
 // Same 24-byte wire format as the original firmware.
 struct Heartbeat {
@@ -35,14 +40,27 @@ class RangeLink {
 
   Heartbeat nextHeartbeat(uint32_t now) {
     if (++sequence_ == 0) ++sequence_; // Zero means "no acknowledgement".
+    Heartbeat packet{kMagic, kGroup, session_, sequence_, 0, 0};
+    refreshAcknowledgement(packet, now);
+    return packet;
+  }
+
+  // A retry keeps the same probe sequence while carrying our latest reply.
+  void refreshAcknowledgement(Heartbeat &packet, uint32_t now) const {
     const bool recentPeer = havePeer_ && now - lastReceivedAt_ < kTimeoutMs;
-    return {kMagic, kGroup, session_, sequence_,
-            recentPeer ? peerSession_ : 0, recentPeer ? peerSequence_ : 0};
+    packet.acknowledgedSession = recentPeer ? peerSession_ : 0;
+    packet.acknowledgedSequence = recentPeer ? peerSequence_ : 0;
   }
 
   // Call only when esp_now_send accepts the packet. Acceptance alone does
   // not turn on the LED; a fresh reply from the other board is required.
   void recordSent(const Heartbeat &packet, uint32_t now) {
+    for (Sent &sent : sent_) {
+      if (sent.sequence == packet.sequence) {
+        sent.at = now; // Keep retries from consuming the unique-probe history.
+        return;
+      }
+    }
     sent_[sentIndex_] = {packet.sequence, now};
     sentIndex_ = (sentIndex_ + 1) % kHistorySize;
   }
@@ -59,6 +77,7 @@ class RangeLink {
     if (havePeer_ && !samePeer &&
         receivedAt - lastReceivedAt_ < kTimeoutMs) return false;
 
+    bool freshHeartbeat = true;
     if (!samePeer || packet.session != peerSession_) {
       std::memcpy(peerMac_, senderMac, 6);
       peerSession_ = packet.session;
@@ -66,17 +85,22 @@ class RangeLink {
       haveConfirmation_ = false;
       haveConfirmedSequence_ = false;
     } else if (!isNewer(packet.sequence, peerSequence_)) {
-      return false; // Duplicate or reordered packet: no fresh contact.
+      if (packet.sequence != peerSequence_) return false; // Reordered packet.
+      freshHeartbeat = false;
+      // A retransmission can carry a NEW acknowledgement even though its
+      // probe sequence is unchanged. Its heartbeat is not counted twice.
     }
-    peerSequence_ = packet.sequence;
-    lastReceivedAt_ = receivedAt;
-    ++receivedCount_;
+    if (freshHeartbeat) {
+      peerSequence_ = packet.sequence;
+      lastReceivedAt_ = receivedAt;
+      ++receivedCount_;
+    }
 
     if (packet.acknowledgedSession != session_ ||
         packet.acknowledgedSequence == 0 ||
         (haveConfirmedSequence_ &&
          !isNewer(packet.acknowledgedSequence, lastConfirmedSequence_))) {
-      return true;
+      return freshHeartbeat;
     }
     for (const Sent &sent : sent_) {
       if (sent.sequence != 0 &&
@@ -90,7 +114,7 @@ class RangeLink {
         break;
       }
     }
-    return true;
+    return freshHeartbeat;
   }
 
   bool inRange(uint32_t now) const {
@@ -119,6 +143,9 @@ class RangeLink {
   bool ledOn() const { return ledOn_; }
   uint32_t receivedCount() const { return receivedCount_; }
   uint32_t confirmedCount() const { return confirmedCount_; }
+  bool acknowledged(uint32_t sequence) const {
+    return haveConfirmedSequence_ && lastConfirmedSequence_ == sequence;
+  }
 
  private:
   static bool isNewer(uint32_t candidate, uint32_t previous) {
@@ -136,6 +163,59 @@ class RangeLink {
   uint32_t receivedCount_ = 0, confirmedCount_ = 0, lastToggleAt_ = 0;
   bool havePeer_ = false, haveConfirmation_ = false;
   bool haveConfirmedSequence_ = false, blinking_ = false, ledOn_ = false;
+};
+
+// One outstanding heartbeat at a time, with bounded nonblocking ACK retries.
+// This is tested on the host and used unchanged by the ESP32 firmware.
+class HeartbeatSender {
+ public:
+  void begin(uint32_t now, uint32_t startupDelay) {
+    *this = HeartbeatSender{};
+    cycleStartedAt_ = now;
+    cycleInterval_ = startupDelay;
+  }
+
+  bool prepare(uint32_t now, RangeLink &link, uint32_t random,
+               Heartbeat &packet, bool &isRetry) {
+    if (pending_) {
+      if (link.acknowledged(pendingPacket_.sequence)) {
+        pending_ = false;
+      } else {
+        if (now - lastAttemptAt_ < retryWait_) return false;
+        if (retries_ < kMaxRetries) {
+          ++retries_;
+          ++retryCount_;
+          lastAttemptAt_ = now;
+          retryWait_ = kRetryBaseMs + random % (kRetryJitterMs + 1);
+          link.refreshAcknowledgement(pendingPacket_, now);
+          packet = pendingPacket_;
+          isRetry = true;
+          return true;
+        }
+        pending_ = false; // Retry budget exhausted; discovery will continue.
+      }
+    }
+    if (now - cycleStartedAt_ < cycleInterval_) return false;
+    cycleStartedAt_ = now;
+    cycleInterval_ = kHeartbeatMinMs + random % (kHeartbeatJitterMs + 1);
+    pendingPacket_ = link.nextHeartbeat(now);
+    pending_ = true;
+    retries_ = 0;
+    lastAttemptAt_ = now;
+    retryWait_ = kRetryBaseMs + (random >> 8) % (kRetryJitterMs + 1);
+    packet = pendingPacket_;
+    isRetry = false;
+    return true;
+  }
+
+  uint32_t retryCount() const { return retryCount_; }
+
+ private:
+  Heartbeat pendingPacket_{};
+  uint32_t cycleStartedAt_ = 0, cycleInterval_ = 0;
+  uint32_t lastAttemptAt_ = 0, retryWait_ = 0, retryCount_ = 0;
+  uint8_t retries_ = 0;
+  bool pending_ = false;
 };
 
 } // namespace range_led

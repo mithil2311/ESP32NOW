@@ -39,10 +39,14 @@ header = (project / "include/range_link.h").read_text()
 settings = {
     "LED_PIN": (main, "2"),
     "LED_ACTIVE_LOW": (main, "false"),
-    "WIFI_CHANNEL": (main, "1"),
+    "WIFI_CHANNEL": (main, "6"),
+    "USE_LONG_RANGE": (main, "true"),
     "kGroup": (header, "0x32B11A01"),
     "kTimeoutMs": (header, "3000"),
     "kBlinkMs": (header, "250"),
+    "kRetryBaseMs": (header, "300"),
+    "kRetryJitterMs": (header, "100"),
+    "kMaxRetries": (header, "2"),
 }
 for name, (source, value) in settings.items():
     assert re.search(rf"\b{name}\s*=\s*{value}\s*;", source), name

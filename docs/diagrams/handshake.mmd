@@ -4,9 +4,13 @@ sequenceDiagram
     A->>B: Heartbeat A1
     Note over B: Receive A1 and prepare acknowledgement
     B->>A: Heartbeat B1 + acknowledgement of A1
-    Note over A: Fresh reply confirms two-way contact and start blinking
+    Note over A: Fresh reply confirms two-way contact, LED starts blinking
     A->>B: Heartbeat A2 + acknowledgement of B1
-    Note over B: Fresh reply confirms two-way contact and start blinking
+    Note over B: Fresh reply confirms two-way contact, LED starts blinking
+    opt ACK missing after 300 to 400 ms
+        A->>B: Retry same probe with latest acknowledgement
+        Note over A,B: Up to 2 retries per probe with randomized delay
+    end
     A->>B: Continue periodic heartbeats + acknowledgements
     B->>A: Continue periodic heartbeats + acknowledgements
     Note over A,B: If fresh acknowledgements stop for 3 seconds, LEDs turn off

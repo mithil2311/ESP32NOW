@@ -231,6 +231,114 @@ void unrelatedThirdBoard() {
   require(!p.a.link.inRange(4000), "New peer reused old confirmation");
 }
 
+void boundedRetrySchedule() {
+  Node a(1, 100);
+  range_led::HeartbeatSender sender;
+  sender.begin(0, 100);
+  Heartbeat packet{};
+  bool retry = false;
+  require(!sender.prepare(99, a.link, 0, packet, retry), "Ignored startup jitter");
+  require(sender.prepare(100, a.link, 0, packet, retry) && !retry, "No first probe");
+  const auto sequence = packet.sequence;
+  require(!sender.prepare(399, a.link, 0, packet, retry), "Retried too early");
+  require(sender.prepare(400, a.link, 0, packet, retry) && retry, "No first retry");
+  require(packet.sequence == sequence, "Retry changed probe sequence");
+  require(sender.prepare(700, a.link, 0, packet, retry) && retry, "No second retry");
+  require(packet.sequence == sequence, "Second retry changed sequence");
+  require(!sender.prepare(999, a.link, 0, packet, retry), "Ignored ACK wait");
+  require(sender.prepare(1000, a.link, 0, packet, retry) && !retry,
+          "Discovery did not continue after retry exhaustion");
+  require(packet.sequence != sequence && sender.retryCount() == 2,
+          "Retry limit was not enforced");
+  require(!a.link.inRange(1000), "Sending retries falsely confirmed contact");
+}
+
+void acknowledgementCancelsRetry() {
+  Pair p;
+  range_led::HeartbeatSender sender;
+  sender.begin(0, 0);
+  Heartbeat packet{};
+  bool retry = false;
+  require(sender.prepare(0, p.a.link, 0, packet, retry), "No initial probe");
+  p.a.link.recordSent(packet, 0);
+  p.b.link.receive(p.a.mac.data(), packet, 0);
+  send(p.b, p.a, 50);
+  require(!sender.prepare(300, p.a.link, 0, packet, retry), "Retried an ACKed probe");
+  require(sender.retryCount() == 0, "ACK did not cancel pending retry");
+  require(sender.prepare(400, p.a.link, 0, packet, retry) && !retry,
+          "Normal heartbeat did not resume after ACK");
+}
+
+void duplicateRetryCarriesFreshAcknowledgement() {
+  Pair p;
+  auto a = p.a.link.nextHeartbeat(0);
+  auto b = p.b.link.nextHeartbeat(0);
+  p.a.link.recordSent(a, 0);
+  p.b.link.recordSent(b, 0);
+  p.a.link.receive(p.b.mac.data(), b, 0);
+  p.b.link.receive(p.a.mac.data(), a, 0);
+  require(!p.a.link.inRange(0) && !p.b.link.inRange(0), "No ACK expected yet");
+  p.a.link.refreshAcknowledgement(a, 300);
+  p.a.link.recordSent(a, 300);
+  require(!p.b.link.receive(p.a.mac.data(), a, 300), "Duplicate heartbeat counted twice");
+  require(p.b.link.receivedCount() == 1 && p.b.link.inRange(300),
+          "Retry's new acknowledgement was ignored");
+  p.b.link.refreshAcknowledgement(b, 310);
+  p.b.link.recordSent(b, 310);
+  p.a.link.receive(p.b.mac.data(), b, 310);
+  require(p.a.link.inRange(310), "Both simultaneous probes did not recover");
+}
+
+void retryRecoversDroppedProbe() {
+  Pair p;
+  range_led::HeartbeatSender sender;
+  sender.begin(0, 0);
+  Heartbeat first{}, retryPacket{};
+  bool retry = false;
+  require(sender.prepare(0, p.a.link, 0, first, retry), "No initial probe");
+  p.a.link.recordSent(first, 0); // Initial A-to-B transmission is dropped.
+  send(p.b, p.a, 10);
+  require(sender.prepare(300, p.a.link, 0, retryPacket, retry) && retry,
+          "No retry for lost probe");
+  require(retryPacket.sequence == first.sequence &&
+          retryPacket.acknowledgedSequence != 0, "Retry lost identity or reply");
+  p.a.link.recordSent(retryPacket, 300);
+  p.b.link.receive(p.a.mac.data(), retryPacket, 300);
+  send(p.b, p.a, 310);
+  require(p.a.link.inRange(310) && p.b.link.inRange(310), "Retry did not restore contact");
+}
+
+void retryJitterAcrossClockWrap() {
+  Node a(1, 100);
+  range_led::HeartbeatSender sender;
+  const uint32_t start = UINT32_MAX - 100;
+  sender.begin(start, 50);
+  Heartbeat packet{};
+  bool retry = false;
+  require(sender.prepare(start + 50, a.link, 100, packet, retry), "No startup probe");
+  require(!sender.prepare(start + 349, a.link, 100, packet, retry), "Clock wrap caused early retry");
+  require(sender.prepare(start + 350, a.link, 100, packet, retry) && retry, "No wrapped retry");
+  require(!sender.prepare(start + 749, a.link, 100, packet, retry), "Ignored retry jitter");
+  require(sender.prepare(start + 750, a.link, 100, packet, retry) && retry, "No jittered retry");
+}
+
+void repeatedRetriesDoNotKeepContactAlive() {
+  Pair p;
+  p.connect();
+  auto a = send(p.a, p.b, 500);
+  auto b = send(p.b, p.a, 510);
+  for (uint32_t now = 800; now <= 4100; now += 300) {
+    p.a.link.refreshAcknowledgement(a, now);
+    p.b.link.refreshAcknowledgement(b, now);
+    p.a.link.recordSent(a, now);
+    p.b.link.recordSent(b, now);
+    p.a.link.receive(p.b.mac.data(), b, now);
+    p.b.link.receive(p.a.mac.data(), a, now);
+  }
+  require(!p.a.link.inRange(4100) && !p.b.link.inRange(4100),
+          "Repeated acknowledgements kept stale contact alive");
+}
+
 int main() {
   struct Test { const char *name; void (*run)(); };
   const Test tests[] = {
@@ -250,6 +358,12 @@ int main() {
       {"local reboot rejects old acknowledgements", localRebootRejectsOldAcknowledgement},
       {"millis and sequence counter wraparound", clockAndSequenceWraparound},
       {"unrelated third board", unrelatedThirdBoard},
+      {"bounded ACK retry schedule", boundedRetrySchedule},
+      {"acknowledgement cancels retries", acknowledgementCancelsRetry},
+      {"duplicate retry carries a fresh acknowledgement", duplicateRetryCarriesFreshAcknowledgement},
+      {"retry recovers a dropped probe", retryRecoversDroppedProbe},
+      {"retry jitter and clock wrap", retryJitterAcrossClockWrap},
+      {"repeated retries cannot preserve stale contact", repeatedRetriesDoNotKeepContactAlive},
   };
   unsigned passed = 0;
   for (const Test &test : tests) {
